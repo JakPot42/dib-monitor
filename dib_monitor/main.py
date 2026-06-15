@@ -1,0 +1,310 @@
+from __future__ import annotations
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Optional
+
+from fastapi import Depends, FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session
+
+from .config import DEMO_MODE, APP_TITLE
+from .database import get_db, init_db
+from .models import FinancialAssessment, OwnershipRecord, Supplier
+from .monte_carlo import run_gbm_distress
+from .risk_engine import compute_financial_risk, compute_ownership_risk, compute_combined_risk
+from .claude_analyst import AnalystError, extract_financials, flag_ownership_concerns
+from .edgar_client import search_company_cik, fetch_latest_10k_text
+from .pdf_export import generate_resilience_pdf
+from .seed_data import _load_seed_data
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine = init_db()
+    from sqlalchemy.orm import Session as _Session
+    with _Session(engine) as db:
+        _load_seed_data(db)
+    yield
+
+
+app = FastAPI(title=APP_TITLE, lifespan=lifespan)
+templates = Jinja2Templates(directory=str(__file__).replace("main.py", "templates"))
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _get_latest_assessment(db: Session, supplier_id: int) -> Optional[FinancialAssessment]:
+    return (
+        db.query(FinancialAssessment)
+        .filter(FinancialAssessment.supplier_id == supplier_id)
+        .order_by(FinancialAssessment.id.desc())
+        .first()
+    )
+
+
+def _get_owners(db: Session, assessment_id: int) -> list[OwnershipRecord]:
+    return (
+        db.query(OwnershipRecord)
+        .filter(OwnershipRecord.assessment_id == assessment_id)
+        .all()
+    )
+
+
+def _risk_color(level: str) -> str:
+    return {"LOW": "#2ecc71", "MEDIUM": "#f39c12", "HIGH": "#e74c3c", "CRITICAL": "#8e44ad"}.get(
+        level or "", "#95a5a6"
+    )
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request, db: Session = Depends(get_db)):
+    suppliers = db.query(Supplier).order_by(Supplier.id).all()
+    supplier_rows = []
+    for s in suppliers:
+        a = _get_latest_assessment(db, s.id)
+        supplier_rows.append({
+            "supplier": s,
+            "assessment": a,
+            "risk_color": _risk_color(a.combined_risk_level if a else None),
+        })
+    return templates.TemplateResponse(request, "index.html", {
+        "title": APP_TITLE,
+        "demo_mode": DEMO_MODE,
+        "supplier_rows": supplier_rows,
+    })
+
+
+@app.post("/supplier/search")
+def supplier_search(
+    request: Request,
+    company_name: str = Form(...),
+    dib_category: str = Form("Tier 1 Subcontractor"),
+    db: Session = Depends(get_db),
+):
+    name = company_name.strip()
+    existing = db.query(Supplier).filter(Supplier.name.ilike(f"%{name}%")).first()
+    if existing:
+        return RedirectResponse(f"/supplier/{existing.id}", status_code=303)
+
+    supplier = Supplier(name=name, dib_category=dib_category)
+    db.add(supplier)
+    db.commit()
+    db.refresh(supplier)
+    return RedirectResponse(f"/supplier/{supplier.id}", status_code=303)
+
+
+@app.get("/supplier/{supplier_id}", response_class=HTMLResponse)
+def supplier_detail(request: Request, supplier_id: int, db: Session = Depends(get_db)):
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier:
+        return HTMLResponse("Supplier not found.", status_code=404)
+
+    assessment = _get_latest_assessment(db, supplier_id)
+    owners = _get_owners(db, assessment.id) if assessment else []
+
+    return templates.TemplateResponse(request, "supplier.html", {
+        "title": APP_TITLE,
+        "demo_mode": DEMO_MODE,
+        "supplier": supplier,
+        "assessment": assessment,
+        "owners": owners,
+        "risk_color": _risk_color(assessment.combined_risk_level if assessment else None),
+        "fin_risk_color": _risk_color(assessment.financial_risk_level if assessment else None),
+        "own_risk_color": _risk_color(assessment.ownership_risk_level if assessment else None),
+        "error": None,
+    })
+
+
+@app.post("/supplier/{supplier_id}/analyze")
+def supplier_analyze(
+    request: Request,
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier:
+        return HTMLResponse("Supplier not found.", status_code=404)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    error_msg = None
+    assessment = None
+
+    if DEMO_MODE and supplier.is_demo:
+        # Demo suppliers already have pre-seeded assessments — skip live analysis
+        return RedirectResponse(f"/supplier/{supplier_id}", status_code=303)
+
+    # Live analysis: EDGAR → Claude → Monte Carlo
+    filing_text = None
+    cik = supplier.cik
+    if not cik:
+        cik = search_company_cik(supplier.name)
+        if cik:
+            supplier.cik = cik
+            db.commit()
+
+    if cik:
+        filing_text = fetch_latest_10k_text(cik)
+
+    extracted: dict = {}
+    if filing_text and api_key:
+        try:
+            extracted = extract_financials(supplier.name, filing_text, api_key)
+        except AnalystError as exc:
+            error_msg = f"Claude extraction failed: {exc}"
+    elif not api_key:
+        error_msg = "ANTHROPIC_API_KEY not set — cannot run live analysis."
+    elif not filing_text:
+        error_msg = "Could not retrieve filing from SEC EDGAR."
+
+    if error_msg:
+        assessment_obj = _get_latest_assessment(db, supplier_id)
+        owners = _get_owners(db, assessment_obj.id) if assessment_obj else []
+        return templates.TemplateResponse(request, "supplier.html", {
+            "title": APP_TITLE,
+            "demo_mode": DEMO_MODE,
+            "supplier": supplier,
+            "assessment": assessment_obj,
+            "owners": owners,
+            "risk_color": _risk_color(assessment_obj.combined_risk_level if assessment_obj else None),
+            "fin_risk_color": _risk_color(assessment_obj.financial_risk_level if assessment_obj else None),
+            "own_risk_color": _risk_color(assessment_obj.ownership_risk_level if assessment_obj else None),
+            "error": error_msg,
+        }, status_code=200)
+
+    # Build assessment from extracted data
+    ebitda = extracted.get("ebitda_mm")
+    total_debt = extracted.get("total_debt_mm")
+    debt_service = extracted.get("debt_service_annual_mm")
+    near_term = extracted.get("near_term_maturity_mm")
+
+    debt_to_ebitda = (total_debt / ebitda) if (ebitda and total_debt and ebitda > 0) else None
+
+    # Monte Carlo
+    mc = {}
+    if ebitda and debt_service:
+        mc = run_gbm_distress(
+            current_ebitda_mm=ebitda,
+            debt_service_annual_mm=debt_service,
+        )
+
+    # Risk scoring
+    fin_score, fin_level = compute_financial_risk(
+        debt_to_ebitda=debt_to_ebitda,
+        distress_prob_1yr=mc.get("prob_1yr", 0),
+        distress_prob_3yr=mc.get("prob_3yr", 0),
+        going_concern_flag=extracted.get("going_concern_flag", False),
+        near_term_maturity_mm=near_term,
+    )
+    own_score, own_level = compute_ownership_risk([])
+    comb_score, comb_level = compute_combined_risk(fin_score, own_score)
+
+    assessment = FinancialAssessment(
+        supplier_id=supplier_id,
+        filing_type="10-K",
+        filing_period="Live",
+        assessed_at=datetime.utcnow(),
+        revenue_mm=extracted.get("revenue_mm"),
+        total_debt_mm=total_debt,
+        cash_mm=extracted.get("cash_mm"),
+        ebitda_mm=ebitda,
+        debt_service_annual_mm=debt_service,
+        debt_to_ebitda=debt_to_ebitda,
+        covenant_summary=extracted.get("covenant_summary"),
+        going_concern_flag=extracted.get("going_concern_flag", False),
+        going_concern_quote=extracted.get("going_concern_quote"),
+        near_term_maturity_mm=near_term,
+        near_term_maturity_date=extracted.get("near_term_maturity_date"),
+        extraction_confidence=extracted.get("confidence", "low"),
+        distress_prob_1yr=mc.get("prob_1yr"),
+        distress_prob_2yr=mc.get("prob_2yr"),
+        distress_prob_3yr=mc.get("prob_3yr"),
+        financial_risk_score=fin_score,
+        financial_risk_level=fin_level,
+        ownership_risk_score=own_score,
+        ownership_risk_level=own_level,
+        combined_risk_score=comb_score,
+        combined_risk_level=comb_level,
+        claude_summary=None,
+    )
+    db.add(assessment)
+    db.commit()
+
+    return RedirectResponse(f"/supplier/{supplier_id}", status_code=303)
+
+
+@app.get("/supplier/{supplier_id}/report.pdf")
+def supplier_pdf(supplier_id: int, db: Session = Depends(get_db)):
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier:
+        return Response("Supplier not found.", status_code=404)
+
+    assessment = _get_latest_assessment(db, supplier_id)
+    if not assessment:
+        return Response("No assessment found for this supplier.", status_code=404)
+
+    owners = _get_owners(db, assessment.id)
+
+    supplier_dict = {
+        "name": supplier.name,
+        "dib_category": supplier.dib_category,
+        "sector": supplier.sector,
+    }
+    assessment_dict = {
+        "assessed_at": str(assessment.assessed_at or datetime.utcnow()),
+        "filing_period": assessment.filing_period,
+        "revenue_mm": assessment.revenue_mm,
+        "total_debt_mm": assessment.total_debt_mm,
+        "cash_mm": assessment.cash_mm,
+        "ebitda_mm": assessment.ebitda_mm,
+        "debt_service_annual_mm": assessment.debt_service_annual_mm,
+        "debt_to_ebitda": assessment.debt_to_ebitda,
+        "covenant_summary": assessment.covenant_summary,
+        "going_concern_flag": assessment.going_concern_flag,
+        "going_concern_quote": assessment.going_concern_quote,
+        "near_term_maturity_mm": assessment.near_term_maturity_mm,
+        "near_term_maturity_date": assessment.near_term_maturity_date,
+        "distress_prob_1yr": assessment.distress_prob_1yr or 0,
+        "distress_prob_2yr": assessment.distress_prob_2yr or 0,
+        "distress_prob_3yr": assessment.distress_prob_3yr or 0,
+        "financial_risk_score": assessment.financial_risk_score,
+        "financial_risk_level": assessment.financial_risk_level,
+        "ownership_risk_score": assessment.ownership_risk_score,
+        "ownership_risk_level": assessment.ownership_risk_level,
+        "combined_risk_score": assessment.combined_risk_score,
+        "combined_risk_level": assessment.combined_risk_level,
+    }
+    owners_list = [
+        {
+            "owner_name": o.owner_name,
+            "pct_owned": o.pct_owned,
+            "country": o.country,
+            "cfius_flag": o.cfius_flag,
+            "flag_reason": o.flag_reason,
+        }
+        for o in owners
+    ]
+
+    pdf_bytes = generate_resilience_pdf(supplier_dict, assessment_dict, owners_list, DEMO_MODE)
+    filename = f"DIB_Resilience_{supplier.name.replace(' ', '_')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/stats")
+def api_stats(db: Session = Depends(get_db)):
+    return {
+        "suppliers": db.query(Supplier).count(),
+        "assessments": db.query(FinancialAssessment).count(),
+        "high_risk": db.query(FinancialAssessment).filter(
+            FinancialAssessment.combined_risk_level.in_(["HIGH", "CRITICAL"])
+        ).count(),
+        "cfius_flags": db.query(OwnershipRecord).filter(OwnershipRecord.cfius_flag.is_(True)).count(),
+        "demo_mode": DEMO_MODE,
+    }
