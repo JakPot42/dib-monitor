@@ -11,11 +11,17 @@ from sqlalchemy.orm import Session
 
 from .config import DEMO_MODE, APP_TITLE
 from .database import get_db, init_db
-from .models import FinancialAssessment, OwnershipRecord, Supplier
+from .models import EarningsSignal, FinancialAssessment, OwnershipRecord, Supplier
 from .monte_carlo import run_gbm_distress
 from .risk_engine import compute_financial_risk, compute_ownership_risk, compute_combined_risk
-from .claude_analyst import AnalystError, extract_financials, flag_ownership_concerns
-from .edgar_client import search_company_cik, fetch_latest_10k_text
+from .claude_analyst import (
+    AnalystError,
+    extract_earnings_signals,
+    extract_financials,
+    flag_ownership_concerns,
+    generate_portfolio_brief,
+)
+from .edgar_client import fetch_latest_8k_exhibit99, search_company_cik, fetch_latest_10k_text
 from .pdf_export import generate_resilience_pdf
 from .seed_data import _load_seed_data
 
@@ -55,6 +61,15 @@ def _get_owners(db: Session, assessment_id: int) -> list[OwnershipRecord]:
 def _risk_color(level: str) -> str:
     return {"LOW": "#2ecc71", "MEDIUM": "#f39c12", "HIGH": "#e74c3c", "CRITICAL": "#8e44ad"}.get(
         level or "", "#95a5a6"
+    )
+
+
+def _get_latest_earnings_signal(db: Session, supplier_id: int) -> Optional[EarningsSignal]:
+    return (
+        db.query(EarningsSignal)
+        .filter(EarningsSignal.supplier_id == supplier_id)
+        .order_by(EarningsSignal.id.desc())
+        .first()
     )
 
 
@@ -306,5 +321,228 @@ def api_stats(db: Session = Depends(get_db)):
             FinancialAssessment.combined_risk_level.in_(["HIGH", "CRITICAL"])
         ).count(),
         "cfius_flags": db.query(OwnershipRecord).filter(OwnershipRecord.cfius_flag.is_(True)).count(),
+        "earnings_signals": db.query(EarningsSignal).count(),
         "demo_mode": DEMO_MODE,
     }
+
+
+# ── Earnings signal routes ────────────────────────────────────────────────────
+
+@app.get("/supplier/{supplier_id}/earnings", response_class=HTMLResponse)
+def supplier_earnings(request: Request, supplier_id: int, db: Session = Depends(get_db)):
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier:
+        return HTMLResponse("Supplier not found.", status_code=404)
+
+    signal = _get_latest_earnings_signal(db, supplier_id)
+    signals_list = []
+    if signal and signal.signals_json:
+        import json
+        try:
+            signals_list = json.loads(signal.signals_json)
+        except Exception:
+            signals_list = []
+
+    return templates.TemplateResponse(request, "earnings.html", {
+        "title": APP_TITLE,
+        "demo_mode": DEMO_MODE,
+        "supplier": supplier,
+        "signal": signal,
+        "signals_list": signals_list,
+        "error": None,
+    })
+
+
+@app.post("/supplier/{supplier_id}/analyze-earnings")
+def supplier_analyze_earnings(
+    request: Request,
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = db.get(Supplier, supplier_id)
+    if not supplier:
+        return HTMLResponse("Supplier not found.", status_code=404)
+
+    if DEMO_MODE and supplier.is_demo:
+        return RedirectResponse(f"/supplier/{supplier_id}/earnings", status_code=303)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    error_msg = None
+
+    # Fetch 8-K Exhibit 99 from EDGAR
+    cik = supplier.cik
+    if not cik:
+        cik = search_company_cik(supplier.name)
+        if cik:
+            supplier.cik = cik
+            db.commit()
+
+    exhibit_data = None
+    if cik:
+        exhibit_data = fetch_latest_8k_exhibit99(cik)
+
+    extracted: dict = {}
+    if exhibit_data and api_key:
+        try:
+            extracted = extract_earnings_signals(supplier.name, exhibit_data["text"], api_key)
+        except AnalystError as exc:
+            error_msg = f"Claude extraction failed: {exc}"
+    elif not api_key:
+        error_msg = "ANTHROPIC_API_KEY not set — cannot run live analysis."
+    elif not exhibit_data:
+        error_msg = "Could not retrieve 8-K Exhibit 99 from SEC EDGAR."
+
+    if error_msg:
+        signal = _get_latest_earnings_signal(db, supplier_id)
+        signals_list = []
+        if signal and signal.signals_json:
+            import json
+            try:
+                signals_list = json.loads(signal.signals_json)
+            except Exception:
+                pass
+        return templates.TemplateResponse(request, "earnings.html", {
+            "title": APP_TITLE,
+            "demo_mode": DEMO_MODE,
+            "supplier": supplier,
+            "signal": signal,
+            "signals_list": signals_list,
+            "error": error_msg,
+        }, status_code=200)
+
+    import json
+    new_signal = EarningsSignal(
+        supplier_id=supplier_id,
+        filing_date=exhibit_data.get("filed_date"),
+        accession_number=exhibit_data.get("accession"),
+        signals_json=json.dumps(extracted.get("signals", [])),
+        export_control_flag=extracted.get("export_control_flag", False),
+        supplier_diversion_flag=extracted.get("supplier_diversion_flag", False),
+        key_quote=extracted.get("key_quote"),
+        claude_brief=None,
+        extraction_confidence=extracted.get("confidence", "low"),
+    )
+    db.add(new_signal)
+    db.commit()
+
+    return RedirectResponse(f"/supplier/{supplier_id}/earnings", status_code=303)
+
+
+# ── Portfolio routes ──────────────────────────────────────────────────────────
+
+def _build_portfolio_rows(db: Session) -> list[dict]:
+    """Build data rows for all tracked suppliers with assessments."""
+    suppliers = db.query(Supplier).order_by(Supplier.id).all()
+    rows = []
+    for s in suppliers:
+        assessment = _get_latest_assessment(db, s.id)
+        signal = _get_latest_earnings_signal(db, s.id)
+
+        cfius_count = 0
+        if assessment:
+            cfius_count = (
+                db.query(OwnershipRecord)
+                .filter(
+                    OwnershipRecord.assessment_id == assessment.id,
+                    OwnershipRecord.cfius_flag.is_(True),
+                )
+                .count()
+            )
+
+        earnings_signals = []
+        if signal and signal.signals_json:
+            import json
+            try:
+                earnings_signals = json.loads(signal.signals_json)
+            except Exception:
+                pass
+
+        rows.append({
+            "supplier": s,
+            "assessment": assessment,
+            "signal": signal,
+            "cfius_count": cfius_count,
+            "earnings_signals": earnings_signals,
+            "risk_color": _risk_color(assessment.combined_risk_level if assessment else None),
+        })
+    return rows
+
+
+@app.get("/portfolio", response_class=HTMLResponse)
+def portfolio_view(request: Request, db: Session = Depends(get_db)):
+    rows = _build_portfolio_rows(db)
+    total = len(rows)
+    assessed = sum(1 for r in rows if r["assessment"])
+    high_critical = sum(
+        1 for r in rows
+        if r["assessment"] and r["assessment"].combined_risk_level in ("HIGH", "CRITICAL")
+    )
+    cfius_total = sum(r["cfius_count"] for r in rows)
+    earnings_total = sum(1 for r in rows if r["signal"])
+
+    return templates.TemplateResponse(request, "portfolio.html", {
+        "title": APP_TITLE,
+        "demo_mode": DEMO_MODE,
+        "rows": rows,
+        "total": total,
+        "assessed": assessed,
+        "high_critical": high_critical,
+        "cfius_total": cfius_total,
+        "earnings_total": earnings_total,
+        "brief": None,
+        "error": None,
+    })
+
+
+@app.post("/portfolio/brief", response_class=HTMLResponse)
+def portfolio_brief(request: Request, db: Session = Depends(get_db)):
+    rows = _build_portfolio_rows(db)
+    total = len(rows)
+    assessed = sum(1 for r in rows if r["assessment"])
+    high_critical = sum(
+        1 for r in rows
+        if r["assessment"] and r["assessment"].combined_risk_level in ("HIGH", "CRITICAL")
+    )
+    cfius_total = sum(r["cfius_count"] for r in rows)
+    earnings_total = sum(1 for r in rows if r["signal"])
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    brief = None
+    error_msg = None
+
+    if not api_key:
+        error_msg = "ANTHROPIC_API_KEY not set — cannot generate portfolio brief."
+    else:
+        assessed_rows = [r for r in rows if r["assessment"]]
+        portfolio_data = [
+            {
+                "name": r["supplier"].name,
+                "dib_category": r["supplier"].dib_category,
+                "sector": r["supplier"].sector,
+                "combined_risk_level": r["assessment"].combined_risk_level,
+                "financial_risk_score": r["assessment"].financial_risk_score,
+                "ownership_risk_score": r["assessment"].ownership_risk_score,
+                "distress_prob_1yr": r["assessment"].distress_prob_1yr,
+                "distress_prob_3yr": r["assessment"].distress_prob_3yr,
+                "cfius_flag_count": r["cfius_count"],
+                "earnings_signals": r["earnings_signals"],
+            }
+            for r in assessed_rows
+        ]
+        try:
+            brief = generate_portfolio_brief(portfolio_data, api_key)
+        except AnalystError as exc:
+            error_msg = f"Claude failed to generate portfolio brief: {exc}"
+
+    return templates.TemplateResponse(request, "portfolio.html", {
+        "title": APP_TITLE,
+        "demo_mode": DEMO_MODE,
+        "rows": rows,
+        "total": total,
+        "assessed": assessed,
+        "high_critical": high_critical,
+        "cfius_total": cfius_total,
+        "earnings_total": earnings_total,
+        "brief": brief,
+        "error": error_msg,
+    })

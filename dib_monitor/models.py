@@ -72,3 +72,18 @@ class OwnershipRecord(Base):
     cfius_flag = Column(Boolean, default=False)
     flag_reason = Column(Text, nullable=True)
     risk_level = Column(String, nullable=True)       # HIGH/MEDIUM/LOW
+
+
+class EarningsSignal(Base):
+    __tablename__ = "earnings_signals"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    supplier_id = Column(Integer, nullable=False, index=True)
+    filing_date = Column(String, nullable=True)       # e.g., "2026-01-28"
+    accession_number = Column(String, nullable=True)  # SEC accession number
+    assessed_at = Column(DateTime, default=datetime.utcnow)
+    signals_json = Column(Text, nullable=True)        # JSON array of signal strings
+    export_control_flag = Column(Boolean, default=False)
+    supplier_diversion_flag = Column(Boolean, default=False)
+    key_quote = Column(Text, nullable=True)
+    claude_brief = Column(Text, nullable=True)
+    extraction_confidence = Column(String, default="demo")

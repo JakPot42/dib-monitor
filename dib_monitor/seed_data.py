@@ -4,8 +4,9 @@ Two fictional defense suppliers: one HIGH risk, one LOW risk.
 All companies, names, and financial figures are fictional.
 """
 from __future__ import annotations
+import json
 from sqlalchemy.orm import Session
-from .models import Supplier, FinancialAssessment, OwnershipRecord
+from .models import EarningsSignal, FinancialAssessment, OwnershipRecord, Supplier
 
 
 def _load_seed_data(db: Session) -> None:
@@ -187,5 +188,42 @@ def _load_seed_data(db: Session) -> None:
     ]
     for o in owners2:
         db.add(o)
+
+    # ── Earnings signal for Arrowhead (Q4 2025 earnings call, 8-K Exhibit 99.1) ──
+    arrowhead_signals = [
+        "Actively diversifying semiconductor sourcing away from PRC-based Tier-1 suppliers "
+        "following October 2025 BIS export control expansion on advanced logic chips",
+        "Expects $18–22M incremental sourcing cost in FY2026 from qualified domestic and "
+        "allied-nation alternate suppliers (Japan, South Korea)",
+        "NEXRAD-II radar program delay attributed in part to restricted component availability "
+        "— management expects resolution by Q3 2026 after domestic qualification completes",
+        "CEO: 'We are no longer comfortable with a single-country concentration for advanced "
+        "processing components on any defense-critical program'",
+    ]
+    es1 = EarningsSignal(
+        supplier_id=s1.id,
+        filing_date="2026-01-28",
+        accession_number="0001234567-26-000128",
+        signals_json=json.dumps(arrowhead_signals),
+        export_control_flag=True,
+        supplier_diversion_flag=True,
+        key_quote=(
+            "We are no longer comfortable with a single-country concentration for advanced "
+            "processing components on any defense-critical program. The BIS October rule "
+            "was the forcing function we needed to accelerate our domestic qualification roadmap."
+        ),
+        claude_brief=(
+            "Arrowhead's Q4 2025 earnings call disclosed material supply chain restructuring "
+            "driven by BIS export control expansion. Management confirmed active diversion away "
+            "from PRC-based semiconductor suppliers, projecting $18–22M in incremental FY2026 "
+            "sourcing costs while domestic and allied-nation alternates complete qualification. "
+            "The NEXRAD-II program delay — already a financial risk factor — is now confirmed as "
+            "partly supply-chain-driven, a forward-looking signal absent from the FY2025 10-K "
+            "which cites only 'program schedule risk.' This language represents a meaningful "
+            "escalation in disclosed exposure and warrants close monitoring through Q3 2026."
+        ),
+        extraction_confidence="demo",
+    )
+    db.add(es1)
 
     db.commit()

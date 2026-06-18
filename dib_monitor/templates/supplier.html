@@ -11,12 +11,13 @@
       {% if supplier.cik %} · CIK: {{ supplier.cik }}{% endif %}
     </div>
   </div>
-  <div style="display:flex; gap:8px;">
+  <div style="display:flex; gap:8px; flex-wrap:wrap;">
     {% if not (demo_mode and supplier.is_demo) %}
     <form method="post" action="/supplier/{{ supplier.id }}/analyze">
       <button type="submit" class="btn btn-primary">▶ Run Analysis</button>
     </form>
     {% endif %}
+    <a href="/supplier/{{ supplier.id }}/earnings" class="btn btn-outline">📋 Earnings Signals</a>
     {% if assessment %}
     <a href="/supplier/{{ supplier.id }}/report.pdf" class="btn btn-success">⬇ Download PDF Report</a>
     {% endif %}

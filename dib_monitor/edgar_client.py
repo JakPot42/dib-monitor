@@ -4,6 +4,7 @@ Only used in live (non-demo) mode. All demo data comes from seed_data.py.
 """
 from __future__ import annotations
 import json
+import re
 from typing import Optional
 import urllib.request
 import urllib.parse
@@ -76,8 +77,6 @@ def fetch_latest_10k_text(cik: str, max_chars: int = 15_000) -> Optional[str]:
             )
             try:
                 raw = _get(filing_url, timeout=20).decode("utf-8", errors="ignore")
-                # Strip HTML tags (very roughly)
-                import re
                 text = re.sub(r"<[^>]+>", " ", raw)
                 text = re.sub(r"\s+", " ", text).strip()
                 return text[:max_chars]
@@ -93,3 +92,79 @@ def fetch_13f_owners(cik: str) -> list[dict]:
     Live 13F parsing requires institutional CIK lookup (out of scope for MVP).
     """
     return []
+
+
+def fetch_latest_8k_exhibit99(cik: str, max_chars: int = 8_000) -> Optional[dict]:
+    """
+    Fetch Exhibit 99 text from the most recent 8-K filing (earnings transcript/press release).
+    Returns {"text": str, "filed_date": str, "accession": str} or None if unavailable.
+
+    8-K Exhibit 99 filings are where executives disclose forward-looking supply chain
+    language (e.g., "diversifying away from Supplier X due to export controls") before
+    that intent appears in formal 10-K filings.
+    """
+    padded_cik = cik.zfill(10)
+    url = f"https://data.sec.gov/submissions/CIK{padded_cik}.json"
+    try:
+        data = json.loads(_get(url))
+    except EdgarError:
+        return None
+
+    filings = data.get("filings", {}).get("recent", {})
+    forms = filings.get("form", [])
+    accessions = filings.get("accessionNumber", [])
+    primary_docs = filings.get("primaryDocument", [])
+    filing_dates = filings.get("filingDate", [])
+
+    for i, form in enumerate(forms):
+        if form != "8-K":
+            continue
+
+        accession_dashes = accessions[i]
+        accession_nodash = accession_dashes.replace("-", "")
+        filed_date = filing_dates[i] if i < len(filing_dates) else "Unknown"
+        cik_int = int(cik)
+
+        # Try the filing index JSON to find an Exhibit 99 document
+        index_url = (
+            f"https://data.sec.gov/Archives/edgar/data/"
+            f"{cik_int}/{accession_nodash}/{accession_dashes}-index.json"
+        )
+        try:
+            index_data = json.loads(_get(index_url, timeout=10))
+            for doc in index_data.get("documents", []):
+                doc_type = str(doc.get("type", "")).upper()
+                filename = doc.get("filename", "")
+                if "EX-99" in doc_type and filename:
+                    exhibit_url = (
+                        f"https://www.sec.gov/Archives/edgar/data/"
+                        f"{cik_int}/{accession_nodash}/{filename}"
+                    )
+                    try:
+                        raw = _get(exhibit_url, timeout=20).decode("utf-8", errors="ignore")
+                        text = re.sub(r"<[^>]+>", " ", raw)
+                        text = re.sub(r"\s+", " ", text).strip()
+                        if len(text) > 100:
+                            return {"text": text[:max_chars], "filed_date": filed_date, "accession": accession_dashes}
+                    except EdgarError:
+                        pass
+        except (EdgarError, Exception):
+            pass
+
+        # Fallback: fetch the primary document of the 8-K itself
+        primary_doc = primary_docs[i] if i < len(primary_docs) else None
+        if primary_doc:
+            doc_url = (
+                f"https://www.sec.gov/Archives/edgar/data/"
+                f"{cik_int}/{accession_nodash}/{primary_doc}"
+            )
+            try:
+                raw = _get(doc_url, timeout=20).decode("utf-8", errors="ignore")
+                text = re.sub(r"<[^>]+>", " ", raw)
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 200:
+                    return {"text": text[:max_chars], "filed_date": filed_date, "accession": accession_dashes}
+            except EdgarError:
+                continue
+
+    return None
