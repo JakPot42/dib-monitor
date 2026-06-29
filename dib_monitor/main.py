@@ -93,6 +93,8 @@ def index(request: Request, db: Session = Depends(get_db)):
     })
 
 
+_MAX_COMPANY_NAME_CHARS = 200
+
 @app.post("/supplier/search")
 def supplier_search(
     request: Request,
@@ -101,6 +103,10 @@ def supplier_search(
     db: Session = Depends(get_db),
 ):
     name = company_name.strip()
+    if not name:
+        return RedirectResponse("/", status_code=303)
+    if len(name) > _MAX_COMPANY_NAME_CHARS:
+        raise HTTPException(status_code=422, detail=f"Company name too long. Maximum {_MAX_COMPANY_NAME_CHARS} characters.")
     existing = db.query(Supplier).filter(Supplier.name.ilike(f"%{name}%")).first()
     if existing:
         return RedirectResponse(f"/supplier/{existing.id}", status_code=303)
