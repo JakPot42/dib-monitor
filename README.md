@@ -2,7 +2,7 @@
 
 Defense Industrial Base supplier financial risk assessment tool. Pulls SEC 10-K/10-Q filings, uses Claude to extract debt terms and covenant language, runs a Monte Carlo (GBM) distress simulation, screens institutional ownership for CFIUS-relevant foreign connections, and generates a Supplier Financial Resilience Report PDF.
 
-**Bridge tool:** [FriendShore](https://github.com/JakPot42/friendshore-supply-chain) flags your Tier-2 supplier as a critical single point of failure. This tool tells you whether that supplier is also financially distressed — and whether their ownership structure raises national security flags.
+**Bridge tool:** FriendShore flags your Tier-2 supplier as a critical single point of failure. This tool tells you whether that supplier is also financially distressed, and whether their ownership structure raises national security flags.
 
 **Policy context:** The DoD Industrial Base Policy office tracks exactly this in its Annual Industrial Capabilities Report to Congress. This tool automates that analysis using public SEC data.
 
